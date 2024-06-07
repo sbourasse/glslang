@@ -7519,9 +7519,21 @@ bool TParseContext::vkRelaxedRemapUniformVariable(const TSourceLoc& loc, TString
 template <typename Function>
 static void ForEachOpaque(const TType& type, const TString& path, Function callback)
 {
-    auto recursion = [&callback](const TType& type, const TString& path, bool skipArray, auto& recursion) -> void {
+    //std::vector<std::pair<TString, std::vector<int>>> array_sizes = {};
+    //std::vector<int> array_sizes = {};
+    //TString path_name = "";
+
+    auto recursion = [&callback](const TType& type, const TString& path, bool skipArray, TArraySizes const& sizes, auto& recursion) -> void {
         if (!skipArray && type.isArray())
         {
+            TArraySizes* sizes_copy = new TArraySizes;
+            *sizes_copy = sizes;
+            for (int index = 0; index < type.getArraySizes()->getNumDims(); ++index)
+                sizes_copy->addInnerSize(type.getArraySizes()->getDimSize(index));
+
+            recursion(type, path, true, *sizes_copy, recursion);
+
+#if 0
             std::vector<int> indices(type.getArraySizes()->getNumDims());
             for (int flatIndex = 0;
                  flatIndex < type.getArraySizes()->getCumulativeSize();
@@ -7547,6 +7559,8 @@ static void ForEachOpaque(const TType& type, const TString& path, Function callb
                         indices[dimIndex] = 0;
                 }
             }
+#endif
+
         }
 
         else if (type.isStruct() && type.containsOpaque())
@@ -7558,17 +7572,17 @@ static void ForEachOpaque(const TType& type, const TString& path, Function callb
                 nextPath.append(".");
                 nextPath.append(typeLoc.type->getFieldName());
 
-                recursion(*(typeLoc.type), nextPath, false, recursion);
+                recursion(*(typeLoc.type), nextPath, false, sizes, recursion);
             }
         }
 
         else if (type.isOpaque())
         {
-            callback(type, path);
+            callback(type, path, sizes);
         }
     };
 
-    recursion(type, path, false, recursion);
+    recursion(type, path, false, {}, recursion);
 }
 
 void TParseContext::vkRelaxedRemapUniformMembers(const TSourceLoc& loc, const TPublicType& publicType, const TType& type,
@@ -7578,11 +7592,14 @@ void TParseContext::vkRelaxedRemapUniformMembers(const TSourceLoc& loc, const TP
         return;
 
     ForEachOpaque(type, identifier,
-                  [&publicType, &loc, this](const TType& type, const TString& path) {
-                      TArraySizes arraySizes = {};
-                      if (type.getArraySizes()) arraySizes = *type.getArraySizes();
+                  [&publicType, &loc, this](const TType& type, const TString& path, const TArraySizes& arraySizes) {
+                      TArraySizes* collapsedArraySizes = new TArraySizes;
+                      if (arraySizes.getNumDims() > 0) collapsedArraySizes->addInnerSize(arraySizes.getCumulativeSize());
+
                       TTypeParameters typeParameters = {};
                       if (type.getTypeParameters()) typeParameters = *type.getTypeParameters();
+
+                      relaxedArraySizes.emplace(path, &arraySizes);
 
                       TPublicType memberType{};
                       memberType.basicType = type.getBasicType();
@@ -7593,7 +7610,7 @@ void TParseContext::vkRelaxedRemapUniformMembers(const TSourceLoc& loc, const TP
                       memberType.matrixRows = type.getMatrixRows();
                       memberType.coopmatNV = type.isCoopMatNV();
                       memberType.coopmatKHR = type.isCoopMatKHR();
-                      memberType.arraySizes = nullptr;
+                      memberType.arraySizes = collapsedArraySizes;
                       memberType.userDef = nullptr;
                       memberType.loc = loc;
                       memberType.typeParameters = (type.getTypeParameters() ? &typeParameters : nullptr);
@@ -7615,7 +7632,7 @@ void TParseContext::vkRelaxedRemapFunctionParameter(TFunction* function, TParame
         return;
 
     ForEachOpaque(*param.type, (param.name ? *param.name : param.type->getFieldName()),
-                  [function, param, newParams](const TType& type, const TString& path) {
+                  [function, param, newParams](const TType& type, const TString& path, const TArraySizes& arraySizes) {
                       TString* memberName = NewPoolTString(path.c_str());
 
                       TType* memberType = new TType();
@@ -7636,15 +7653,18 @@ void TParseContext::vkRelaxedRemapFunctionParameter(TFunction* function, TParame
 //
 // Generates a valid GLSL dereferencing string for the input TIntermNode
 //
-struct AccessChainTraverser : public TIntermTraverser {
-    AccessChainTraverser() : TIntermTraverser(false, false, true)
+struct ArrayCollapseTraverser : public TIntermTraverser {
+    ArrayCollapseTraverser() : TIntermTraverser(false, true, true)
     {}
 
     TString path = "";
     TStorageQualifier topLevelStorageQualifier = TStorageQualifier::EvqLast;
+    TVector<TIntermTyped*> indexNodes{};
+    TIntermediate* intermediate;
+    TIntermTyped* patchedNode;
 
-    bool visitBinary(TVisit, TIntermBinary* binary) override {
-        if (binary->getOp() == EOpIndexDirectStruct)
+    bool visitBinary(TVisit visit, TIntermBinary* binary) override {
+        if (binary->getOp() == EOpIndexDirectStruct && visit == EvPostVisit)
         {
             const TTypeList& members = *binary->getLeft()->getType().getStruct();
             const TTypeLoc& member =
@@ -7653,19 +7673,18 @@ struct AccessChainTraverser : public TIntermTraverser {
 
             if (path != "")
                 path.append(".");
-
             path.append(memberName);
+
+            patchedNode = static_cast<TIntermTyped*>(intermediate->addBinaryNode(EOpIndexDirectStruct, patchedNode, binary->getRight(), binary->getLoc()));
         }
 
-        if (binary->getOp() == EOpIndexDirect)
+        if (binary->getOp() == EOpIndexDirect && visit == EvPostVisit)
+            indexNodes.push_back(binary->getRight());
+
+        if (binary->getOp() == EOpIndexIndirect)
         {
-            const TConstUnionArray& indices = binary->getRight()->getAsConstantUnion()->getConstArray();
-            for (int index = 0; index < indices.size(); ++index)
-            {
-                path.append("[");
-                path.append(String(indices[index].getIConst()));
-                path.append("]");
-            }
+            indexNodes.push_back(binary->getRight());
+            return visit != EvInVisit;
         }
 
         return true;
@@ -7676,15 +7695,42 @@ struct AccessChainTraverser : public TIntermTraverser {
             topLevelStorageQualifier = symbol->getQualifier().storage;
         if (!IsAnonymous(symbol->getName()))
             path.append(symbol->getName());
+        patchedNode = static_cast<TIntermTyped*>(intermediate->addSymbol(*symbol));
     }
 };
 
 TIntermNode* TParseContext::vkRelaxedRemapFunctionArgument(const TSourceLoc& loc, TFunction* function, TIntermTyped* intermTyped)
 {
-    AccessChainTraverser accessChainTraverser{};
-    intermTyped->traverse(&accessChainTraverser);
+    ArrayCollapseTraverser traverser{};
+    traverser.intermediate = &intermediate;
+    intermTyped->traverse(&traverser);
 
-    if (accessChainTraverser.topLevelStorageQualifier == TStorageQualifier::EvqUniform)
+    {
+        const TSymbol* symbol = symbolTable.find(traverser.path);
+        if (!symbol)
+            return intermTyped;
+
+        intermTyped = intermediate.addSymbol(*symbol->getAsVariable());
+        intermTyped->setType(symbol->getType());
+    }
+
+    if (!traverser.indexNodes.empty())
+    {
+        TIntermTyped* subscript = traverser.indexNodes[0];
+        auto arraySizes = relaxedArraySizes[traverser.path];
+        int totalDimSize = 0;
+        for (int index = 1; index < traverser.indexNodes.size(); ++index)
+        {
+            totalDimSize += arraySizes->getDimSize(index);
+            TIntermTyped* factor = static_cast<TIntermTyped*>(intermediate.addConstantUnion(totalDimSize, loc));
+            TIntermTyped* mul = intermediate.addBinaryMath(EOpMul, traverser.indexNodes[index], factor, loc);
+            subscript = intermediate.addBinaryMath(EOpAdd, subscript, mul, loc);
+        }
+
+        intermTyped = handleBracketDereference(loc, intermTyped, subscript);
+    }
+
+    if (traverser.topLevelStorageQualifier == TStorageQualifier::EvqUniform)
     {
         TParameter param = { 0, new TType, {} };
         param.type->shallowCopy(intermTyped->getType());
@@ -7693,11 +7739,13 @@ TIntermNode* TParseContext::vkRelaxedRemapFunctionArgument(const TSourceLoc& loc
         return intermTyped;
     }
 
-    TParameter param = { NewPoolTString(accessChainTraverser.path.c_str()), new TType, {} };
+    TParameter param = { NewPoolTString(traverser.path.c_str()), new TType, {} };
     param.type->shallowCopy(intermTyped->getType());
 
     std::vector<int> newParams = {};
     vkRelaxedRemapFunctionParameter(function, param, &newParams);
+
+    return intermTyped;
 
     if (intermTyped->getType().isOpaque())
     {
@@ -7752,11 +7800,49 @@ TIntermNode* TParseContext::vkRelaxedRemapFunctionArgument(const TSourceLoc& loc
     }
 }
 
-TIntermTyped* TParseContext::vkRelaxedRemapDotDereference(const TSourceLoc&, TIntermTyped& base, const TType& member,
+//
+// Generates a GLSL dereferencing string suitable for relaxed opaque remapping
+// Trims array subscript operators
+//
+struct AccessChainTraverser : public TIntermTraverser {
+    AccessChainTraverser() : TIntermTraverser(false, true, true)
+    {}
+
+    TString path = "";
+
+    bool visitBinary(TVisit visit, TIntermBinary* binary) override {
+        if (binary->getOp() == EOpIndexDirectStruct && visit == EvPostVisit)
+        {
+            const TTypeList& members = *binary->getLeft()->getType().getStruct();
+            const TTypeLoc& member =
+                members[binary->getRight()->getAsConstantUnion()->getConstArray()[0].getIConst()];
+            TString memberName = member.type->getFieldName();
+
+            if (path != "")
+                path.append(".");
+
+            path.append(memberName);
+        }
+
+        if (binary->getOp() == EOpIndexIndirect)
+            return visit != EvInVisit;
+
+        return true;
+    }
+
+    void visitSymbol(TIntermSymbol* symbol) override {
+        if (!IsAnonymous(symbol->getName()))
+            path.append(symbol->getName());
+    }
+};
+
+TIntermTyped* TParseContext::vkRelaxedRemapDotDereference(const TSourceLoc& loc, TIntermTyped& base, const TType& member,
     const TString& identifier)
 {
     if (!member.isOpaque())
         return &base;
+
+    return &base;
 
     AccessChainTraverser traverser{};
     base.traverse(&traverser);

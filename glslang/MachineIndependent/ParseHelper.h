@@ -180,7 +180,6 @@ public:
     // Basic parsing state, easily accessible to the grammar
 
     TSymbolTable& symbolTable;        // symbol table that goes with the current language, version, and profile
-    TVector<TString> relaxedSymbols;
     int statementNestingLevel;        // 0 if outside all flow control or compound statements
     int loopNestingLevel;             // 0 if outside all loops
     int structNestingLevel;           // 0 if outside structures
@@ -198,6 +197,9 @@ public:
     int beginInvocationInterlockCount;
     int endInvocationInterlockCount;
     bool compileOnly = false;
+
+    TVector<TString> relaxedSymbols;  // symbols containing opaque types to be hidden under Vulkan relaxed rules
+    TMap<TString, TArraySizes const*> relaxedArraySizes; // original sizes for collapsed arrays of opaques
 
 protected:
     TParseContextBase(TParseContextBase&);
